@@ -17,6 +17,7 @@ use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{Window, WindowId};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::init();
     let event_loop = EventLoop::new()?;
     let mut app = Application::new();
     event_loop.run_app(&mut app).map_err(Into::into)
@@ -33,6 +34,15 @@ struct WindowState {
     gl_context: glutin::context::PossiblyCurrentContext,
     gl_surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
     gl: Arc<glow::Context>,
+    program: glow::Program,
+    vertex_array: glow::VertexArray,
+
+    egui_ctx: egui::Context,
+    egui_winit: egui_winit::State,
+    egui_painter: egui_glow::Painter,
+
+    show_color_picker: bool,
+    color: [f32; 3],
 }
 
 impl Application {
@@ -46,7 +56,7 @@ impl Application {
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
         let window_attributes = Window::default_attributes()
-            .with_title("Glow OpenGL Window")
+            .with_title("Glow OpenGL Window with egui - Press SPACE for color picker")
             .with_inner_size(PhysicalSize::new(800, 600));
 
         let template = ConfigTemplateBuilder::new()
@@ -73,7 +83,6 @@ impl Application {
             .as_ref()
             .and_then(|window| window.window_handle().ok().map(|h| h.as_raw()));
         let gl_display = gl_config.display();
-        //let raw_window_handle = window.raw_window_handle();
         let window = window.unwrap();
 
         let attrs = window.build_surface_attributes(Default::default()).unwrap();
@@ -83,7 +92,6 @@ impl Application {
                 .unwrap()
         };
 
-        //let context_attributes = ContextAttributesBuilder::new().build(Some(raw_window_handle));
         let context_attributes = ContextAttributesBuilder::new()
             .with_context_api(ContextApi::OpenGl(Some(glutin::context::Version {
                 major: 4,
@@ -99,7 +107,8 @@ impl Application {
             glow::Context::from_loader_function_cstr(|s| gl_display.get_proc_address(s).cast())
         });
 
-        unsafe {
+        // Create OpenGL resources for rendering a simple triangle
+        let (program, vertex_array) = unsafe {
             let vertex_array = gl
                 .create_vertex_array()
                 .expect("Cannot create vertex array");
@@ -107,6 +116,7 @@ impl Application {
 
             let program = gl.create_program().expect("Cannot create program");
 
+            // Simple shaders that render a triangle with a uniform color
             let (vertex_shader_source, fragment_shader_source) = (
                 r#"const vec2 verts[3] = vec2[3](
                 vec2(0.5f, 1.0f),
@@ -119,10 +129,11 @@ impl Application {
                 gl_Position = vec4(vert - 0.5, 0.0, 1.0);
             }"#,
                 r#"precision mediump float;
+            uniform vec3 u_color;
             in vec2 vert;
             out vec4 color;
             void main() {
-                color = vec4(vert, 0.5, 1.0);
+                color = vec4(u_color, 1.0);
             }"#,
             );
 
@@ -156,9 +167,25 @@ impl Application {
                 gl.delete_shader(shader);
             }
 
-            gl.use_program(Some(program));
-            gl.clear_color(0.1, 0.2, 0.3, 1.0);
-        }
+            (program, vertex_array)
+        };
+
+        // Initialize egui context and state
+        let egui_ctx = egui::Context::default();
+        let egui_winit = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+
+        // Create egui painter for rendering egui with glow
+        let egui_painter = egui_glow::Painter::new(gl.clone(), "", None, false).unwrap();
+
+        // Request focus for the window to ensure keyboard events are received
+        window.focus_window();
 
         let window_id = window.id();
         let window_state = WindowState {
@@ -166,6 +193,13 @@ impl Application {
             gl_context,
             gl_surface,
             gl,
+            program,
+            vertex_array,
+            egui_ctx,
+            egui_winit,
+            egui_painter,
+            show_color_picker: false,
+            color: [1.0, 0.5, 0.2],
         };
 
         self.windows.insert(window_id, window_state);
@@ -188,54 +222,133 @@ impl ApplicationHandler for Application {
             None => return,
         };
 
+        // IMPORTANT: Handle keyboard input BEFORE passing to egui
+        // This allows us to intercept keys for application-level shortcuts
+        // Issue: Initially keyboard events weren't being received because we weren't
+        // checking for them explicitly and the window might not have had focus
+        match &event {
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == winit::event::ElementState::Pressed {
+                    if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space)
+                    {
+                        window_state.show_color_picker = !window_state.show_color_picker;
+                        window_state.window.request_redraw();
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Pass event to egui for UI interaction
+        let event_response = window_state
+            .egui_winit
+            .on_window_event(&window_state.window, &event);
+        if event_response.repaint {
+            window_state.window.request_redraw();
+        }
+
         match event {
             WindowEvent::CloseRequested => {
+                drop(window_state);
                 self.windows.remove(&window_id);
                 if self.windows.is_empty() {
                     event_loop.exit();
                 }
+                return;
             }
             WindowEvent::RedrawRequested => unsafe {
-                //let window_state = self.windows.get_mut(&window_id).unwrap();
+                let size = window_state.window.inner_size();
 
-                // Begin egui frame
-                // let raw_input = window_state
-                //     .egui_state
-                //     .take_egui_input(&window_state.window);
-                // let full_output = window_state.egui_ctx.run(raw_input, |ctx| {
-                //     egui::CentralPanel::default().show(ctx, |ui| {
-                //         ui.heading("My egui Application");
-                //         ui.horizontal(|ui| {
-                //             let name_label = ui.label("Your name: ");
-                //             ui.text_edit_singleline(&mut self.name)
-                //                 .labelled_by(name_label.id);
-                //         });
-                //         ui.add(egui::Slider::new(&mut self.age, 0..=120).text("age"));
-                //         if ui.button("Increment").clicked() {
-                //             self.age += 1;
-                //         }
-                //         ui.label(format!("Hello '{}', age {}", self.name, self.age));
-                //     });
-                // });
-
-                // Render egui on top
-                // let clipped_primitives = window_state
-                //     .egui_ctx
-                //     .tessellate(full_output.shapes, full_output.pixels_per_point);
-
-                // let size = window_state.window.inner_size();
-                // window_state.egui_painter.paint_primitives(
-                //     [size.width, size.height],
-                //     full_output.pixels_per_point,
-                //     &clipped_primitives,
-                // );
-
-                // window_state
-                //     .egui_state
-                //     .handle_platform_output(&window_state.window, full_output.platform_output);
-
+                // Clear and draw triangle with custom color
+                window_state
+                    .gl
+                    .viewport(0, 0, size.width as i32, size.height as i32);
+                window_state.gl.clear_color(0.1, 0.2, 0.3, 1.0);
                 window_state.gl.clear(glow::COLOR_BUFFER_BIT);
+
+                window_state.gl.use_program(Some(window_state.program));
+                window_state
+                    .gl
+                    .bind_vertex_array(Some(window_state.vertex_array));
+
+                // Set the triangle color from our state
+                let color_location = window_state
+                    .gl
+                    .get_uniform_location(window_state.program, "u_color");
+                window_state.gl.uniform_3_f32(
+                    color_location.as_ref(),
+                    window_state.color[0],
+                    window_state.color[1],
+                    window_state.color[2],
+                );
+
                 window_state.gl.draw_arrays(glow::TRIANGLES, 0, 3);
+
+                // Prepare egui frame
+                let raw_input = window_state
+                    .egui_winit
+                    .take_egui_input(&window_state.window);
+                let show_color_picker = &mut window_state.show_color_picker;
+                let color = &mut window_state.color;
+
+                // Run egui UI code
+                let full_output = window_state.egui_ctx.run(raw_input, |ctx| {
+                    if *show_color_picker {
+                        egui::Window::new("Color Picker")
+                            .default_size([300.0, 200.0])
+                            .open(show_color_picker)
+                            .show(ctx, |ui| {
+                                ui.heading("Triangle Color");
+                                ui.separator();
+
+                                ui.label("Red:");
+                                ui.add(egui::Slider::new(&mut color[0], 0.0..=1.0));
+
+                                ui.label("Green:");
+                                ui.add(egui::Slider::new(&mut color[1], 0.0..=1.0));
+
+                                ui.label("Blue:");
+                                ui.add(egui::Slider::new(&mut color[2], 0.0..=1.0));
+
+                                ui.separator();
+                                ui.label("Press SPACE to toggle this window");
+                            });
+                    }
+                });
+
+                // Handle platform-specific output (cursor changes, clipboard, etc.)
+                window_state
+                    .egui_winit
+                    .handle_platform_output(&window_state.window, full_output.platform_output);
+
+                // CRITICAL: Handle texture updates from egui
+                // Issue: Initially we got "Failed to find texture Managed(0)" warnings
+                // because we weren't uploading egui's font atlas and other textures to the GPU.
+                // egui generates texture deltas (new textures or updates) that must be uploaded
+                // before rendering, otherwise egui can't render text or images.
+                for (id, image_delta) in &full_output.textures_delta.set {
+                    window_state.egui_painter.set_texture(*id, image_delta);
+                }
+
+                // Tessellate egui's shapes into triangles for rendering
+                let clipped_primitives = window_state
+                    .egui_ctx
+                    .tessellate(full_output.shapes, full_output.pixels_per_point);
+
+                // Render egui on top of our OpenGL content
+                window_state.egui_painter.paint_primitives(
+                    [size.width, size.height],
+                    full_output.pixels_per_point,
+                    &clipped_primitives,
+                );
+
+                // Free textures that are no longer needed
+                for id in &full_output.textures_delta.free {
+                    window_state.egui_painter.free_texture(*id);
+                }
+
+                // Present the rendered frame
                 window_state
                     .gl_surface
                     .swap_buffers(&window_state.gl_context)
@@ -259,6 +372,15 @@ impl ApplicationHandler for Application {
         if self.windows.is_empty() {
             self.create_window(event_loop)
                 .expect("Failed to create window");
+        }
+    }
+
+    // Continuously request redraws to keep the application responsive
+    // Issue: Without this, the window would only redraw on explicit events,
+    // making the UI feel unresponsive and animations wouldn't work smoothly
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        for window_state in self.windows.values() {
+            window_state.window.request_redraw();
         }
     }
 }
