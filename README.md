@@ -1,0 +1,3 @@
+- Started glow_run.rs, drawn a triangle using glow and winit
+- then implemented ai_one.rs which added support to egui, the winit event loop manages egui, little complex
+- implemented eframe in egui, so, instead of making winit event loop manages everything, I made eframe event loop manage winit, seems simpler
