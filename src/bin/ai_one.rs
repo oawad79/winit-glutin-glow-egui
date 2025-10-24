@@ -250,12 +250,10 @@ impl ApplicationHandler for Application {
 
         match event {
             WindowEvent::CloseRequested => {
-                drop(window_state);
                 self.windows.remove(&window_id);
                 if self.windows.is_empty() {
                     event_loop.exit();
                 }
-                return;
             }
             WindowEvent::RedrawRequested => unsafe {
                 let size = window_state.window.inner_size();
